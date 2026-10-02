@@ -24,6 +24,10 @@ export const useFrameStore = defineStore('frame', {
     count(state): number {
       return state.frames.length;
     },
+    /** 已实拍确认的帧数（帧粒度镜头进度） */
+    takenCount(state): number {
+      return state.frames.filter((f) => f.shotTaken).length;
+    },
     selected(state): FrameEntry | undefined {
       if (state.selectedFrameNo === null) return undefined;
       return state.frames.find((f) => f.frameNo === state.selectedFrameNo);
@@ -74,11 +78,17 @@ export const useFrameStore = defineStore('frame', {
               iso: anchor.iso,
               shutterAngle: anchor.shutterAngle,
               lighting: anchor.lighting,
+              // 新插入的帧默认停在上一格的绝对位姿（相邻位移为 0），
+              // 道具轨迹仍是规划来源，保存道具区间时会重新展开覆盖。
+              planPose: anchor.planPose ? JSON.parse(JSON.stringify(anchor.planPose)) : {},
             }
           : {}),
         ...seed,
         frameNo: index + 1,
         id: undefined,
+        shotTaken: false,
+        takenAt: undefined,
+        takenCount: undefined,
       };
       this.frames = [...this.frames.slice(0, index), merged, ...this.frames.slice(index)];
       this.frames = this.frames.map((f, idx) => ({ ...f, frameNo: idx + 1 }));
@@ -134,6 +144,38 @@ export const useFrameStore = defineStore('frame', {
     },
     speedOf(frame: FrameEntry, fps: number): number {
       return estimateSpeed(frame.propOffsetMm, fps);
+    },
+    /** 场记确认：把指定帧号（含）之后的帧标记为已实拍，不改动计划位姿 */
+    async confirmTakenFrom(frameNo: number, takenCount?: number) {
+      if (this.shotId === null) return;
+      const ids = this.frames
+        .filter((f) => f.frameNo >= frameNo && !f.shotTaken && typeof f.id === 'number')
+        .map((f) => f.id as number);
+      if (!ids.length) return;
+      await api.confirmFramesTaken(ids, takenCount);
+      this.frames = await api.listFrames(this.shotId);
+    },
+    /**
+     * 场记确认补拍完成：把补拍区间的帧按当前轨迹固化为实拍结果
+     * （计划随之收敛到实拍，原有实拍记录保留），再标记已实拍。
+     */
+    async confirmReshootFrom(frameNo: number, props: import('../types/prop').PropState[]) {
+      if (this.shotId === null) return;
+      const ids = this.frames
+        .filter((f) => f.frameNo >= frameNo && typeof f.id === 'number')
+        .map((f) => f.id as number);
+      if (!ids.length) return;
+      await api.confirmFramesTaken(ids, undefined, { applyNewPlan: true, props });
+      this.frames = await api.listFrames(this.shotId);
+    },
+    /** 撤销单帧实拍确认 */
+    async clearTaken(frameNo: number) {
+      if (this.shotId === null) return;
+      const target = this.frames.find((f) => f.frameNo === frameNo);
+      if (target && typeof target.id === 'number') {
+        await api.clearFrameTaken(target.id);
+        this.frames = await api.listFrames(this.shotId);
+      }
     },
   },
 });

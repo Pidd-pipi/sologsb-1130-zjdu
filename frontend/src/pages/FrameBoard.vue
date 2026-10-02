@@ -10,8 +10,11 @@ import { useFrameStore } from '../stores/frameStore';
 import { useFrameSequence } from '../hooks/useFrameSequence';
 import { useLocalDraft } from '../hooks/useLocalDraft';
 import { durationToFrames, framesToDuration } from '../utils/frameMath';
+import { deltaAgainst, findReshootStart } from '../utils/propPlan';
+import * as api from '../db/api';
 import { APERTURE_OPTIONS, EXPOSURE_OPTIONS, ISO_OPTIONS, SHUTTER_ANGLE_OPTIONS } from '../utils/exposure';
 import type { BatchExposure, FrameEntry } from '../types/frame';
+import type { PropState } from '../types/prop';
 import type { Shot } from '../types/shot';
 import FrameStrip from '../components/common/FrameStrip.vue';
 import ExposureForm from '../components/common/ExposureForm.vue';
@@ -26,6 +29,7 @@ const { insertAfter, removeAt, move, patch, select, syncShotRange, totalDuration
 
 const activeShotId = ref<number | null>(null);
 const feedback = ref('');
+const propsRows = ref<PropState[]>([]);
 const newFrame = ref<Partial<FrameEntry>>({
   shotCount: 2,
   exposureSec: 0.25,
@@ -47,6 +51,17 @@ const { draft: batch, reset: resetBatch } = useLocalDraft<BatchExposure>('frame-
 const activeShot = computed<Shot | undefined>(() => (activeShotId.value === null ? undefined : shotStore.byId(activeShotId.value)));
 const planned = computed(() => (activeShot.value ? durationToFrames(activeShot.value.durationSec, activeShot.value.fps) : 0));
 const ordered = computed(() => frames.value.slice().sort((a, b) => a.frameNo - b.frameNo));
+/** 实拍记录与当前规划比对：最早需要补拍的一格 */
+const reshootFrom = computed(() => findReshootStart(frames.value, propsRows.value));
+const takenFrames = computed(() => frames.value.filter((f) => f.shotTaken).length);
+
+/** 每格相对上一格的相邻位移（道具轨迹展开后的绝对位姿差） */
+function deltaOf(frame: FrameEntry): number {
+  const index = ordered.value.findIndex((f) => f.frameNo === frame.frameNo);
+  if (index < 0) return 0;
+  return deltaAgainst(ordered.value[index], ordered.value[index - 1]).total;
+}
+
 const exposureOptions = EXPOSURE_OPTIONS;
 const apertureOptions = APERTURE_OPTIONS;
 const isoOptions = ISO_OPTIONS;
@@ -57,13 +72,18 @@ onMounted(async () => {
   const first = shots.value[0];
   if (first && typeof first.id === 'number') {
     activeShotId.value = first.id;
-    await frameStore.loadForShot(first.id);
+    await loadShot(first.id);
   }
 });
 
 watch(activeShotId, async (id) => {
-  if (typeof id === 'number') await frameStore.loadForShot(id);
+  if (typeof id === 'number') await loadShot(id);
 });
+
+async function loadShot(id: number) {
+  await frameStore.loadForShot(id);
+  propsRows.value = await api.listProps(id);
+}
 
 function flash(text: string) {
   feedback.value = text;
@@ -150,9 +170,15 @@ function shiftFrame(frame: FrameEntry, dir: -1 | 1) {
     <template v-else-if="activeShot">
       <p v-if="feedback" class="feedback" data-testid="board-feedback">{{ feedback }}</p>
 
+      <div v-if="reshootFrom !== null" class="reshoot-banner" data-testid="reshoot-banner">
+        <strong>第 {{ reshootFrom }} 格起需要补拍</strong>
+        <span>道具轨迹改动落在已实拍帧上，已拍帧未被覆盖；请到「道具位移轨迹」页由场记确认后再推进进度。</span>
+      </div>
+
       <div class="stat-row">
         <div class="stat"><span class="label">镜号</span><span class="value small mono">{{ activeShot.code }}</span></div>
         <div class="stat"><span class="label">条带帧数</span><span class="value">{{ frames.length }}</span></div>
+        <div class="stat"><span class="label">已实拍格数</span><span class="value">{{ takenFrames }}</span></div>
         <div class="stat"><span class="label">计划张数</span><span class="value">{{ planned }}</span></div>
         <div class="stat"><span class="label">当前时长</span><span class="value small">{{ totalDuration }} s</span></div>
         <div class="stat"><span class="label">帧率</span><span class="value small">{{ fps }} fps</span></div>
@@ -167,7 +193,14 @@ function shiftFrame(frame: FrameEntry, dir: -1 | 1) {
             <button type="button" class="btn small" @click="syncShotRange">重算时长</button>
           </div>
         </div>
-        <FrameStrip :frames="ordered" :selected="selectedFrameNo" @update:selected="select" @reorder="doReorder" @patch="patchFrame" />
+        <FrameStrip
+          :frames="ordered"
+          :selected="selectedFrameNo"
+          :reshoot-from="reshootFrom"
+          @update:selected="select"
+          @reorder="doReorder"
+          @patch="patchFrame"
+        />
       </div>
 
       <div class="two-panel">
@@ -216,17 +249,23 @@ function shiftFrame(frame: FrameEntry, dir: -1 | 1) {
         <div class="panel-head"><h2>帧序明细</h2><span class="muted">可上下移动单帧，序号自动重排</span></div>
         <table class="table" data-testid="board-table">
           <thead>
-            <tr><th>位次</th><th>帧号</th><th>张数</th><th>曝光 s</th><th>光圈</th><th>ISO</th><th>位移 mm</th><th>操作</th></tr>
+            <tr><th>位次</th><th>帧号</th><th>张数</th><th>曝光 s</th><th>光圈</th><th>ISO</th><th>相邻位移 mm</th><th>实拍</th><th>操作</th></tr>
           </thead>
           <tbody>
-            <tr v-for="(frame, index) in ordered" :key="frame.id ?? index" :class="{ active: frame.frameNo === selectedFrameNo }" @click="select(frame.frameNo)">
+            <tr
+              v-for="(frame, index) in ordered"
+              :key="frame.id ?? index"
+              :class="{ active: frame.frameNo === selectedFrameNo, reshoot: reshootFrom !== null && frame.frameNo >= reshootFrom }"
+              @click="select(frame.frameNo)"
+            >
               <td>{{ index + 1 }}</td>
               <td class="mono">{{ frame.frameNo }}</td>
               <td>{{ frame.shotCount }} 张</td>
               <td>{{ frame.exposureSec }}</td>
               <td>f/{{ frame.aperture }}</td>
               <td>{{ frame.iso }}</td>
-              <td>{{ frame.propOffsetMm }}</td>
+              <td class="mono">{{ deltaOf(frame) }}</td>
+              <td>{{ frame.shotTaken ? '✓ 已拍' : reshootFrom !== null && frame.frameNo >= reshootFrom ? '待补拍' : '○ 待拍' }}</td>
               <td class="row-actions">
                 <button type="button" class="btn tiny" :disabled="index === 0" @click.stop="shiftFrame(frame, -1)">上移</button>
                 <button type="button" class="btn tiny" :disabled="index === ordered.length - 1" @click.stop="shiftFrame(frame, 1)">下移</button>
@@ -422,5 +461,19 @@ h1 {
   border-radius: 8px;
   padding: 8px 12px;
   font-size: 13px;
+}
+.reshoot-banner {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  background: #fff5f0;
+  border: 1px solid #f3c9b4;
+  color: #9c4a24;
+  border-radius: 10px;
+  padding: 10px 16px;
+  font-size: 13px;
+}
+.table tbody tr.reshoot {
+  background: #fff7f3;
 }
 </style>

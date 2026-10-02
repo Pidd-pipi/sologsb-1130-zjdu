@@ -3,6 +3,7 @@ import { defineStore } from 'pinia';
 import * as api from '../db/api';
 import { toPlain } from '../db';
 import { buildFrameRange, framesToDuration } from '../utils/frameMath';
+import { planFramesFrom } from '../utils/propPlan';
 import type { Shot } from '../types/shot';
 import { createEmptyShot } from '../types/shot';
 import type { FrameEntry } from '../types/frame';
@@ -77,16 +78,20 @@ export const useShotStore = defineStore('shot', {
       this.shots = this.shots.map((s) => (s.id === id ? { ...next, id } : s));
       await this.rerangeFrames(id);
     },
-    /** 把帧序号重新压缩进 [startFrame, endFrame]，并重算时长 */
+    /** 把帧序号重新压缩进 [startFrame, endFrame]，并以道具轨迹展开逐帧计划 */
     async rerangeFrames(shotId: number) {
       const shot = this.shots.find((s) => s.id === shotId);
       if (!shot) return;
       const rows = await api.listFrames(shotId);
-      const next = rows
+      const renumbered = rows
         .slice()
         .sort((a, b) => a.frameNo - b.frameNo)
         .map((row, idx) => ({ ...row, frameNo: shot.startFrame + idx }));
-      await api.updateFrames(next);
+      // 帧号整体移动后，帧序仍以道具绝对位姿区间为规划来源重新展开；
+      // 已实拍帧保留原计划（重算结果里不覆盖），差异交由补拍流程处理。
+      const propRows = await api.listProps(shotId);
+      const replanned = planFramesFrom(renumbered, propRows, shot.startFrame);
+      await api.updateFrames(replanned);
     },
     async setStatus(id: number, status: Shot['status']) {
       await api.updateShot(id, { status });

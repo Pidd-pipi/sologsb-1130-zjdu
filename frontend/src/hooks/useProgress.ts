@@ -1,5 +1,6 @@
 /**
- * 拍摄进度：由实拍张数与废帧数计算镜头完成百分比与剩余张数。
+ * 拍摄进度：由实拍张数、废帧数与帧粒度实拍确认计算镜头完成百分比与剩余张数。
+ * 场记在帧序上确认实拍后才回写镜头进度；takes 表中的原有实拍记录始终保留并计入。
  * 被 / 与 /progress 消费。
  */
 import { computed, ref } from 'vue';
@@ -7,6 +8,7 @@ import * as api from '../db/api';
 import { useShotStore } from '../stores/shotStore';
 import { durationToFrames } from '../utils/frameMath';
 import type { Shot } from '../types/shot';
+import type { FrameEntry } from '../types/frame';
 import type { TakeLog, WasteBucket } from '../types/take';
 import { createEmptyTake } from '../types/take';
 
@@ -33,14 +35,22 @@ export function computeProgress(planned: number, taken: number, wasted: number) 
 export function useProgress() {
   const shotStore = useShotStore();
   const takes = ref<TakeLog[]>([]);
+  const frameRows = ref<FrameEntry[]>([]);
   const loading = ref(false);
+
+  /** 某镜头已场记确认的帧数 */
+  function framesTakenOf(shotId: number | undefined): number {
+    return frameRows.value.filter((f) => f.shotId === shotId && f.shotTaken).length;
+  }
 
   const summaries = computed<ShotProgressSummary[]>(() =>
     shotStore.shots.map((shot) => {
       const planned = durationToFrames(shot.durationSec, shot.fps);
       const rows = takes.value.filter((t) => t.shotId === shot.id);
-      const taken = rows.reduce((sum, r) => sum + (r.takenFrames || 0), 0);
+      // 实拍进度取「登记张数」与「已确认帧格数」的较大者，两套实拍记录都保留
+      const loggedTaken = rows.reduce((sum, r) => sum + (r.takenFrames || 0), 0);
       const wasted = rows.reduce((sum, r) => sum + (r.wastedFrames || 0), 0);
+      const taken = Math.max(loggedTaken, framesTakenOf(shot.id));
       const p = computeProgress(planned, taken, wasted);
       return { shotId: shot.id ?? 0, code: shot.code, ...p };
     }),
@@ -76,7 +86,9 @@ export function useProgress() {
   async function loadTakes() {
     loading.value = true;
     try {
-      takes.value = await api.listTakes();
+      const [takeRows, allFrames] = await Promise.all([api.listTakes(), api.listAllFrames()]);
+      takes.value = takeRows;
+      frameRows.value = allFrames;
     } finally {
       loading.value = false;
     }
@@ -85,17 +97,18 @@ export function useProgress() {
   function emptyTake(shot: Shot): TakeLog {
     const planned = durationToFrames(shot.durationSec, shot.fps);
     const rows = takes.value.filter((t) => t.shotId === shot.id);
-    const taken = rows.reduce((sum, r) => sum + (r.takenFrames || 0), 0);
+    const taken = Math.max(rows.reduce((sum, r) => sum + (r.takenFrames || 0), 0), framesTakenOf(shot.id));
     const wasted = rows.reduce((sum, r) => sum + (r.wastedFrames || 0), 0);
     const p = computeProgress(planned, taken, wasted);
     return { ...createEmptyTake(shot.id ?? 0, shot.code), remainingFrames: p.remaining, percent: p.percent };
   }
 
-  /** 登记一条实拍记录，并回写镜头完成百分比 */
+  /** 登记一条实拍记录，并回写镜头完成百分比（原有记录保留） */
   async function registerTake(shot: Shot, date: string, takenFrames: number, wastedFrames: number) {
     const planned = durationToFrames(shot.durationSec, shot.fps);
     const rows = takes.value.filter((t) => t.shotId === shot.id);
-    const prevTaken = rows.reduce((sum, r) => sum + (r.takenFrames || 0), 0);
+    const prevLogged = rows.reduce((sum, r) => sum + (r.takenFrames || 0), 0);
+    const prevTaken = Math.max(prevLogged, framesTakenOf(shot.id));
     const prevWasted = rows.reduce((sum, r) => sum + (r.wastedFrames || 0), 0);
     const p = computeProgress(planned, prevTaken + takenFrames, prevWasted + wastedFrames);
     const row: TakeLog = {
@@ -114,6 +127,18 @@ export function useProgress() {
     return { ...row, id };
   }
 
+  /** 场记按帧确认实拍后回写进度；不新增/删除任何 takes 记录 */
+  async function syncFrameProgress(shot: Shot) {
+    const planned = durationToFrames(shot.durationSec, shot.fps);
+    const rows = takes.value.filter((t) => t.shotId === shot.id);
+    const loggedTaken = rows.reduce((sum, r) => sum + (r.takenFrames || 0), 0);
+    const wasted = rows.reduce((sum, r) => sum + (r.wastedFrames || 0), 0);
+    const taken = Math.max(loggedTaken, framesTakenOf(shot.id));
+    const p = computeProgress(planned, taken, wasted);
+    if (typeof shot.id === 'number') await shotStore.syncProgress(shot.id, p.percent);
+    return p;
+  }
+
   async function removeTake(id: number) {
     await api.deleteTake(id);
     takes.value = takes.value.filter((t) => t.id !== id);
@@ -128,6 +153,7 @@ export function useProgress() {
     loadTakes,
     emptyTake,
     registerTake,
+    syncFrameProgress,
     removeTake,
     computeProgress,
   };

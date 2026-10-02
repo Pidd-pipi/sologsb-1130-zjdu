@@ -11,9 +11,11 @@ import { useShotStore } from '../stores/shotStore';
 import { useFrameStore } from '../stores/frameStore';
 import { useFrameSequence } from '../hooks/useFrameSequence';
 import { useProgress } from '../hooks/useProgress';
+import { usePropPlan } from '../hooks/usePropPlan';
 import * as api from '../db/api';
 import { durationToFrames, estimateSpeed, framesToDuration } from '../utils/frameMath';
-import { FIXATION_OPTIONS, type Fixation, type PropState } from '../types/prop';
+import { deltaAgainst, keyframesOf, poseAtFrame } from '../utils/propPlan';
+import { FIXATION_OPTIONS, type Fixation, type PropPose, type PropState } from '../types/prop';
 import { SHOT_STATUS_OPTIONS, type ShotStatus } from '../types/shot';
 import type { FrameEntry } from '../types/frame';
 import { SHOT_COUNT_OPTIONS } from '../types/frame';
@@ -31,9 +33,9 @@ const frameStore = useFrameStore();
 const { frames, selectedFrameNo } = storeToRefs(frameStore);
 
 const { insertAfter, removeAt, move, patch, select, syncShotRange } = useFrameSequence();
-const { registerTake, summaries, loadTakes, computeProgress } = useProgress();
+const { registerTake, summaries, loadTakes, computeProgress, syncFrameProgress } = useProgress();
+const { load: loadPlan, props, reshootFrom, saveProp, removeProp: removePropPlan } = usePropPlan();
 
-const props = ref<PropState[]>([]);
 const takeForm = ref({ date: today(), takenFrames: 8, wastedFrames: 0 });
 const propForm = ref({ name: '', fromFrame: 1, toFrame: 12, posX: 0, posY: 0, posZ: 0, rotation: 0, fixation: '支架' as Fixation });
 const exposureDraft = ref<Partial<FrameEntry>>({});
@@ -61,7 +63,7 @@ async function bootstrap(id: number) {
   notFound.value = false;
   await frameStore.loadForShot(id);
   await loadTakes();
-  props.value = await api.listProps(id);
+  await loadPlan(id);
   if (typeof row.id === 'number') shotStore.currentId = row.id;
   const first = frames.value[0];
   exposureDraft.value = first
@@ -169,21 +171,64 @@ async function addProp() {
     fixation: propForm.value.fixation,
     updatedAt: Date.now(),
   };
-  const id = await api.addProp(payload);
-  props.value = [...props.value, { ...payload, id }];
-  propForm.value.name = '';
-  flash('已登记道具状态');
+  try {
+    const result = await saveProp(shotId.value, payload);
+    await frameStore.loadForShot(shotId.value);
+    propForm.value.name = '';
+    flash(
+      result.reshootFrom === null
+        ? '已登记道具轨迹并重算帧序'
+        : `轨迹已重算：第 ${result.reshootFrom} 格起需要补拍，场记确认后才推进进度`,
+    );
+  } catch (e) {
+    flash(e instanceof Error ? e.message : '登记失败，已恢复到动手前的轨迹与帧序');
+  }
 }
 
 async function removeProp(id: number | undefined) {
   if (typeof id !== 'number') return;
-  await api.deleteProp(id);
-  props.value = props.value.filter((p) => p.id !== id);
+  try {
+    const result = await removePropPlan(shotId.value, id);
+    await frameStore.loadForShot(shotId.value);
+    flash(result.reshootFrom === null ? '已删除该道具轨迹并重算' : `删除后第 ${result.reshootFrom} 格起需要补拍`);
+  } catch (e) {
+    flash(e instanceof Error ? e.message : '删除失败，已恢复到动手前的轨迹与帧序');
+  }
 }
 
-/** 按帧号查询该帧上的道具位置（对应 PropState 的帧区间查询动作） */
-function propsAtFrame(frameNo: number): PropState[] {
-  return props.value.filter((p) => frameNo >= p.fromFrame && frameNo <= p.toFrame);
+/** 场记确认补拍：从提示帧格起按当前轨迹固化实拍并回写镜头进度，原有实拍记录保留 */
+async function confirmReshoot() {
+  if (!shot.value || reshootFrom.value === null) return;
+  await frameStore.confirmReshootFrom(reshootFrom.value, props.value);
+  await loadPlan(shotId.value);
+  await loadTakes();
+  const p = await syncFrameProgress(shot.value);
+  flash(`场记已确认第 ${reshootFrom.value} 格起的实拍，镜头进度更新为 ${p.percent}%`);
+}
+
+async function toggleFrameTaken(frame: FrameEntry) {
+  if (!shot.value || typeof frame.id !== 'number') return;
+  if (frame.shotTaken) await frameStore.clearTaken(frame.frameNo);
+  else await frameStore.confirmTakenFrom(frame.frameNo);
+  await loadPlan(shotId.value);
+  await loadTakes();
+  const p = await syncFrameProgress(shot.value);
+  flash(`第 ${frame.frameNo} 帧实拍状态已更新，镜头进度 ${p.percent}%`);
+}
+
+/** 逐帧相邻位移（与道具轨迹页同算法） */
+function frameDelta(frameNo: number): number {
+  const idx = frames.value.findIndex((f) => f.frameNo === frameNo);
+  if (idx < 0) return 0;
+  return deltaAgainst(frames.value[idx], frames.value[idx - 1]).total;
+}
+
+/** 按帧号查询该帧展开后的道具绝对位姿（与道具轨迹页同一规划口径） */
+function propsAtFrame(frameNo: number) {
+  const kfMap = keyframesOf(props.value);
+  const result: Array<{ name: string; pose: PropPose }> = [];
+  for (const [name, keyframes] of kfMap) result.push({ name, pose: poseAtFrame(keyframes, frameNo) });
+  return result;
 }
 
 const selectedProps = computed(() => (selectedFrameNo.value === null ? [] : propsAtFrame(selectedFrameNo.value)));
@@ -227,6 +272,14 @@ function speedOf(frame: FrameEntry) {
 
     <template v-else-if="shot">
       <p v-if="feedback" class="feedback" data-testid="detail-feedback">{{ feedback }}</p>
+
+      <div v-if="reshootFrom !== null" class="reshoot-banner" data-testid="reshoot-banner">
+        <div class="reshoot-text">
+          <strong>第 {{ reshootFrom }} 格起需要补拍</strong>
+          <span>已实拍帧保留原计划未被覆盖；补拍完成后请场记确认，镜头进度才会推进（原有实拍记录保留）。</span>
+        </div>
+        <button type="button" class="btn primary" data-testid="reshoot-confirm" @click="confirmReshoot">场记确认补拍完成</button>
+      </div>
 
       <div class="panel">
         <div class="panel-head"><h2>镜头参数与进度</h2></div>
@@ -288,15 +341,16 @@ function speedOf(frame: FrameEntry) {
         <FrameStrip
           :frames="frames"
           :selected="selectedFrameNo"
+          :reshoot-from="reshootFrom"
           @update:selected="select"
           @reorder="reorder"
           @patch="patchFrame"
         />
         <div v-if="selectedFrameNo !== null" class="prop-lookup" data-testid="prop-lookup">
-          <strong>第 {{ selectedFrameNo }} 帧道具位置：</strong>
-          <span v-if="!selectedProps.length" class="muted">该帧区间内没有已登记道具</span>
-          <span v-for="p in selectedProps" :key="p.id" class="chip">
-            {{ p.name }} ({{ p.posX }}, {{ p.posY }}, {{ p.posZ }}) mm · 旋转 {{ p.rotation }}°
+          <strong>第 {{ selectedFrameNo }} 帧道具绝对位置：</strong>
+          <span v-if="!selectedProps.length" class="muted">还没有登记该帧上的道具轨迹</span>
+          <span v-for="item in selectedProps" :key="item.name" class="chip">
+            {{ item.name }} ({{ item.pose.posX }}, {{ item.pose.posY }}, {{ item.pose.posZ }}) mm · 旋转 {{ item.pose.rotation }}°
           </span>
         </div>
       </div>
@@ -320,13 +374,19 @@ function speedOf(frame: FrameEntry) {
               <th>ISO</th>
               <th>快门角</th>
               <th>灯光</th>
-              <th>位移 mm</th>
+              <th>相邻位移 mm</th>
               <th>位移速度</th>
+              <th>实拍</th>
               <th>操作</th>
             </tr>
           </thead>
           <tbody>
-            <tr v-for="frame in frames" :key="frame.id ?? frame.frameNo" :class="{ active: frame.frameNo === selectedFrameNo }" @click="select(frame.frameNo)">
+            <tr
+              v-for="frame in frames"
+              :key="frame.id ?? frame.frameNo"
+              :class="{ active: frame.frameNo === selectedFrameNo, reshoot: reshootFrom !== null && frame.frameNo >= reshootFrom }"
+              @click="select(frame.frameNo)"
+            >
               <td class="mono">{{ frame.frameNo }}</td>
               <td>
                 <select :value="frame.shotCount" @change="editCell(frame, 'shotCount', ($event.target as HTMLSelectElement).value)">
@@ -338,8 +398,23 @@ function speedOf(frame: FrameEntry) {
               <td><input type="number" min="100" max="3200" step="100" :value="frame.iso" @change="editCell(frame, 'iso', ($event.target as HTMLInputElement).value)" /></td>
               <td><input type="number" min="45" max="360" step="1" :value="frame.shutterAngle" @change="editCell(frame, 'shutterAngle', ($event.target as HTMLInputElement).value)" /></td>
               <td><input type="text" maxlength="20" :value="frame.lighting" @change="editCell(frame, 'lighting', ($event.target as HTMLInputElement).value, false)" /></td>
-              <td><input type="number" min="-200" max="200" step="0.5" :value="frame.propOffsetMm" @change="editCell(frame, 'propOffsetMm', ($event.target as HTMLInputElement).value)" /></td>
+              <td class="mono">
+                <strong>{{ frameDelta(frame.frameNo) }}</strong>
+                <span class="muted">（规划 {{ frame.propOffsetMm }}）</span>
+              </td>
               <td class="muted">{{ speedOf(frame) }} mm/s</td>
+              <td>
+                <button
+                  type="button"
+                  class="taken-btn"
+                  :class="{ on: frame.shotTaken, reshoot: reshootFrom !== null && frame.frameNo >= reshootFrom }"
+                  :data-testid="`frame-taken-${frame.frameNo}`"
+                  :title="frame.shotTaken ? '已实拍，点击撤销确认' : '场记点击确认实拍'"
+                  @click.stop="toggleFrameTaken(frame)"
+                >
+                  {{ frame.shotTaken ? '✓ 已拍' : '○ 待拍' }}
+                </button>
+              </td>
               <td class="row-actions">
                 <button type="button" class="btn tiny" @click.stop="insertAfter(frame.frameNo)">后插</button>
                 <button type="button" class="btn tiny danger" :disabled="frames.length <= 1" @click.stop="removeFrameRow(frame.frameNo)">删除</button>
@@ -374,27 +449,27 @@ function speedOf(frame: FrameEntry) {
       </div>
 
       <div class="panel">
-        <div class="panel-head"><h2>道具轨迹</h2><span class="muted">按帧区间登记道具位置，条带上按帧号可查</span></div>
+        <div class="panel-head"><h2>道具轨迹（规划来源）</h2><span class="muted">登记区间终点绝对位姿，保存后从该段起点重算；完整逐帧表在「道具位移轨迹」页</span></div>
         <div class="prop-form">
           <label class="field"><span>道具名</span><input v-model="propForm.name" type="text" maxlength="20" data-testid="prop-name" /></label>
           <label class="field"><span>起始帧</span><input v-model.number="propForm.fromFrame" type="number" min="1" step="1" data-testid="prop-from" /></label>
           <label class="field"><span>结束帧</span><input v-model.number="propForm.toFrame" type="number" min="1" step="1" data-testid="prop-to" /></label>
-          <label class="field"><span>X mm</span><input v-model.number="propForm.posX" type="number" step="0.5" /></label>
-          <label class="field"><span>Y mm</span><input v-model.number="propForm.posY" type="number" step="0.5" /></label>
-          <label class="field"><span>Z mm</span><input v-model.number="propForm.posZ" type="number" step="0.5" /></label>
-          <label class="field"><span>旋转 °</span><input v-model.number="propForm.rotation" type="number" step="1" /></label>
+          <label class="field"><span>终点 X mm</span><input v-model.number="propForm.posX" type="number" step="0.5" /></label>
+          <label class="field"><span>终点 Y mm</span><input v-model.number="propForm.posY" type="number" step="0.5" /></label>
+          <label class="field"><span>终点 Z mm</span><input v-model.number="propForm.posZ" type="number" step="0.5" /></label>
+          <label class="field"><span>终点旋转 °</span><input v-model.number="propForm.rotation" type="number" step="1" /></label>
           <label class="field">
             <span>固定方式</span>
             <select v-model="propForm.fixation">
               <option v-for="f in fixationOptions" :key="f" :value="f">{{ f }}</option>
             </select>
           </label>
-          <button type="button" class="btn primary" data-testid="prop-submit" @click="addProp">登记道具</button>
+          <button type="button" class="btn primary" data-testid="prop-submit" @click="addProp">登记并重算</button>
         </div>
 
         <table v-if="props.length" class="table" data-testid="prop-table">
           <thead>
-            <tr><th>道具</th><th>帧区间</th><th>X</th><th>Y</th><th>Z</th><th>旋转</th><th>固定</th><th>操作</th></tr>
+            <tr><th>道具</th><th>帧区间</th><th>终点X</th><th>终点Y</th><th>终点Z</th><th>旋转</th><th>固定</th><th>来源</th><th>操作</th></tr>
           </thead>
           <tbody>
             <tr v-for="p in props" :key="p.id">
@@ -405,11 +480,12 @@ function speedOf(frame: FrameEntry) {
               <td>{{ p.posZ }}</td>
               <td>{{ p.rotation }}°</td>
               <td>{{ p.fixation }}</td>
-              <td><button type="button" class="btn tiny danger" @click="removeProp(p.id)">删除</button></td>
+              <td class="muted">{{ p.system ? '旧数据' : '人工' }}</td>
+              <td><button type="button" class="btn tiny danger" @click="removeProp(p.id)">删除重算</button></td>
             </tr>
           </tbody>
         </table>
-        <EmptyState v-else title="还没有道具状态" description="填写道具名与帧区间后登记，即可在帧序条带上按帧查询位置。" />
+        <EmptyState v-else title="还没有道具轨迹" description="登记区间终点绝对位姿后，帧序会显示逐帧绝对位置与相邻位移。" />
       </div>
     </template>
   </section>
@@ -619,5 +695,47 @@ h1 .mono {
   border-radius: 8px;
   padding: 8px 12px;
   font-size: 13px;
+}
+.reshoot-banner {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 14px;
+  background: #fff5f0;
+  border: 1px solid #f3c9b4;
+  color: #9c4a24;
+  border-radius: 10px;
+  padding: 12px 16px;
+}
+.reshoot-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 13px;
+}
+.reshoot-text strong {
+  font-size: 14px;
+}
+.table tbody tr.reshoot {
+  background: #fff7f3;
+}
+.taken-btn {
+  border-radius: 999px;
+  border: 1px solid #cfd6e0;
+  background: #fff;
+  color: #8a94a6;
+  cursor: pointer;
+  font-size: 12px;
+  padding: 3px 10px;
+  white-space: nowrap;
+}
+.taken-btn.on {
+  background: #2fae6a;
+  border-color: #2fae6a;
+  color: #fff;
+}
+.taken-btn.reshoot {
+  border-color: #d98a5f;
+  color: #c06a36;
 }
 </style>
