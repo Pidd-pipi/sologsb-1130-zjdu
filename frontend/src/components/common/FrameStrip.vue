@@ -83,16 +83,18 @@ const shotCountOptions = SHOT_COUNT_OPTIONS;
         v-for="(frame, index) in frames"
         :key="frame.frameNo"
         class="strip-cell"
-        :class="{ active: frame.frameNo === selected, readonly }"
+        :class="{ active: frame.frameNo === selected, readonly, 'cell-reshoot': frame.needsReshoot, 'cell-shot': frame.shotFrame }"
         :style="{ background: colorOf(frame) }"
         :draggable="!readonly"
         :data-testid="`strip-cell-${frame.frameNo}`"
-        :title="`第 ${frame.frameNo} 帧 · ${frame.shotCount} 张 · ${frame.exposureSec}s · f/${frame.aperture} · ISO${frame.iso} · 位移 ${frame.propOffsetMm}mm`"
+        :title="`第 ${frame.frameNo} 帧 · ${frame.shotCount} 张 · ${frame.exposureSec}s · f/${frame.aperture} · ISO${frame.iso} · 位移 ${frame.propOffsetMm}mm${frame.shotFrame ? ' · 已拍' : ''}${frame.needsReshoot ? ' · 需补拍' : ''}`"
         @click="onSelect(frame.frameNo)"
         @dragstart="onDragStart(index, $event)"
         @dragover.prevent
         @drop="onDrop(index)"
       >
+        <span v-if="frame.needsReshoot" class="cell-flag reshoot" data-testid="`strip-reshoot-${frame.frameNo}`">补拍</span>
+        <span v-else-if="frame.shotFrame" class="cell-flag shot">已拍</span>
         <span class="cell-no">{{ frame.frameNo }}</span>
         <span class="cell-sub">{{ frame.shotCount }}张</span>
         <span class="cell-sub">{{ frame.propOffsetMm }}mm</span>
@@ -158,18 +160,19 @@ const shotCountOptions = SHOT_COUNT_OPTIONS;
           />
         </label>
         <label class="field">
-          <span>道具位移 mm</span>
+          <span>道具位置 X mm</span>
           <input
             type="number"
             min="-200"
             max="200"
             step="0.5"
-            :value="selectedFrame.propOffsetMm"
-            :data-testid="`strip-offset-${selectedFrame.frameNo}`"
-            @change="patchSelected({ propOffsetMm: Number(($event.target as HTMLInputElement).value) })"
+            :value="selectedFrame.propPosX"
+            :data-testid="`strip-posx-${selectedFrame.frameNo}`"
+            @change="patchSelected({ propPosX: Number(($event.target as HTMLInputElement).value) })"
           />
         </label>
       </div>
+      <p class="editor-note">相邻位移由道具绝对位置推导，如需调整请改道具区间后重算。</p>
     </div>
   </div>
 </template>
@@ -222,6 +225,32 @@ const shotCountOptions = SHOT_COUNT_OPTIONS;
 .strip-cell.readonly {
   cursor: default;
 }
+.strip-cell.cell-reshoot {
+  box-shadow: 0 0 0 2px #ff9c6e;
+}
+.strip-cell.cell-shot {
+  outline: 1px solid rgba(255, 255, 255, 0.6);
+}
+.cell-flag {
+  position: absolute;
+  top: 3px;
+  right: 3px;
+  font-size: 9px;
+  line-height: 1;
+  padding: 2px 4px;
+  border-radius: 4px;
+  color: #fff;
+  pointer-events: none;
+}
+.cell-flag.reshoot {
+  background: #fa8c16;
+}
+.cell-flag.shot {
+  background: rgba(0, 0, 0, 0.35);
+}
+.strip-cell {
+  position: relative;
+}
 .cell-no {
   font-weight: 700;
   font-size: 14px;
@@ -249,6 +278,11 @@ const shotCountOptions = SHOT_COUNT_OPTIONS;
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
   gap: 8px;
+}
+.editor-note {
+  margin: 8px 0 0;
+  font-size: 11px;
+  color: #8a94a6;
 }
 .field {
   display: flex;

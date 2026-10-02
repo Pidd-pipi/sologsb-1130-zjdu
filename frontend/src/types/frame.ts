@@ -22,8 +22,18 @@ export interface FrameEntry {
   shutterAngle: number;
   /** 灯光配置 */
   lighting: string;
-  /** 道具位移量（mm） */
+  /** 道具绝对位置 X（mm）：由道具区间绝对位置规划而来，已拍帧保留实拍实际值 */
+  propPosX: number;
+  /** 道具绝对位置 Y（mm） */
+  propPosY: number;
+  /** 道具绝对位置 Z（mm） */
+  propPosZ: number;
+  /** 道具位移量（mm）：相邻帧绝对位置之差（ΔX），由规划推导，不再独立填写 */
   propOffsetMm: number;
+  /** 该帧是否已拍摄（场记确认或由实拍张数回填），已拍帧不被新规划直接覆盖 */
+  shotFrame: boolean;
+  /** 该帧是否因规划变更需要补拍（已拍帧实际值与新规划不一致时置位） */
+  needsReshoot: boolean;
   /** 备注 */
   note: string;
   updatedAt: number;
@@ -38,7 +48,12 @@ export const createEmptyFrame = (shotId: number, frameNo: number): FrameEntry =>
   iso: 200,
   shutterAngle: 180,
   lighting: '主灯 + 柔光箱',
+  propPosX: 0,
+  propPosY: 0,
+  propPosZ: 0,
   propOffsetMm: 0,
+  shotFrame: false,
+  needsReshoot: false,
   note: '',
   updatedAt: Date.now(),
 });

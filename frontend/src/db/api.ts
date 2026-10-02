@@ -83,6 +83,14 @@ export async function replaceShotFrames(shotId: number, frames: FrameEntry[]): P
   });
 }
 
+/** 批量写入帧条目（按 id 更新或新增），用于规划确认时原子落库 */
+export async function bulkPutFrames(frames: FrameEntry[]): Promise<void> {
+  if (!frames.length) return;
+  await db.transaction('rw', db.frames, async () => {
+    await db.frames.bulkPut(frames.map((f) => toPlain(f)));
+  });
+}
+
 /* ---------------- props ---------------- */
 
 export async function listProps(shotId: number): Promise<PropState[]> {

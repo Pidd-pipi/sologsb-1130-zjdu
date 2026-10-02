@@ -10,6 +10,7 @@ import { useFrameStore } from '../stores/frameStore';
 import { useFrameSequence } from '../hooks/useFrameSequence';
 import { useLocalDraft } from '../hooks/useLocalDraft';
 import { durationToFrames, framesToDuration } from '../utils/frameMath';
+import { frameDelta, framePos, type Vec3 } from '../utils/propPlanning';
 import { APERTURE_OPTIONS, EXPOSURE_OPTIONS, ISO_OPTIONS, SHUTTER_ANGLE_OPTIONS } from '../utils/exposure';
 import type { BatchExposure, FrameEntry } from '../types/frame';
 import type { Shot } from '../types/shot';
@@ -17,6 +18,7 @@ import FrameStrip from '../components/common/FrameStrip.vue';
 import ExposureForm from '../components/common/ExposureForm.vue';
 import EmptyState from '../components/common/EmptyState.vue';
 import StatusTag from '../components/common/StatusTag.vue';
+import PlanBanner from '../components/common/PlanBanner.vue';
 
 const shotStore = useShotStore();
 const frameStore = useFrameStore();
@@ -47,6 +49,24 @@ const { draft: batch, reset: resetBatch } = useLocalDraft<BatchExposure>('frame-
 const activeShot = computed<Shot | undefined>(() => (activeShotId.value === null ? undefined : shotStore.byId(activeShotId.value)));
 const planned = computed(() => (activeShot.value ? durationToFrames(activeShot.value.durationSec, activeShot.value.fps) : 0));
 const ordered = computed(() => frames.value.slice().sort((a, b) => a.frameNo - b.frameNo));
+/** 逐帧行：绝对位置 + 相邻位移 + 已拍/补拍标记 */
+interface FrameRow {
+  frame: FrameEntry;
+  pos: Vec3;
+  delta: Vec3;
+}
+const frameRows = computed<FrameRow[]>(() => {
+  const rows: FrameRow[] = [];
+  let prev: FrameEntry | null = null;
+  for (const f of ordered.value) {
+    const pos = framePos(f);
+    const delta = prev ? frameDelta(prev, f) : { ...pos };
+    rows.push({ frame: f, pos, delta });
+    prev = f;
+  }
+  return rows;
+});
+const reshootFromFrame = computed(() => activeShot.value?.reshootFromFrame ?? null);
 const exposureOptions = EXPOSURE_OPTIONS;
 const apertureOptions = APERTURE_OPTIONS;
 const isoOptions = ISO_OPTIONS;
@@ -123,6 +143,32 @@ function shiftFrame(frame: FrameEntry, dir: -1 | 1) {
   if (target < 0 || target >= ordered.value.length) return;
   void move(index, target);
 }
+
+/** 以道具绝对位置重算帧序（从最早区间起点），失败自动回滚 */
+async function replanFromProps() {
+  if (activeShotId.value === null) return;
+  try {
+    const result = await frameStore.replanFromProps();
+    if (result && result.reshootFrameNos.length > 0) {
+      flash(`已重算：从第 ${result.reshootFromFrame} 帧起需补拍，待场记确认`);
+    } else if (result && result.changedFrameNos.length) {
+      flash(`已按绝对位置重算 ${result.changedFrameNos.length} 帧位移`);
+    } else {
+      flash('重算完成，帧序无变化');
+    }
+  } catch {
+    flash('重算失败，已恢复动手前的轨迹与帧序');
+  }
+}
+
+async function markReshootDone() {
+  try {
+    await frameStore.markReshootDone();
+    flash('已标记补拍完成，补拍起点已清除');
+  } catch {
+    flash('操作失败，已恢复');
+  }
+}
 </script>
 
 <template>
@@ -149,6 +195,12 @@ function shiftFrame(frame: FrameEntry, dir: -1 | 1) {
 
     <template v-else-if="activeShot">
       <p v-if="feedback" class="feedback" data-testid="board-feedback">{{ feedback }}</p>
+      <PlanBanner />
+
+      <div v-if="reshootFromFrame !== null" class="reshoot-bar" data-testid="reshoot-bar">
+        <span>本镜头从第 <b>{{ reshootFromFrame }}</b> 帧起需补拍（场记已确认规划变更）。</span>
+        <button type="button" class="btn tiny" @click="markReshootDone">标记补拍完成</button>
+      </div>
 
       <div class="stat-row">
         <div class="stat"><span class="label">镜号</span><span class="value small mono">{{ activeShot.code }}</span></div>
@@ -164,6 +216,7 @@ function shiftFrame(frame: FrameEntry, dir: -1 | 1) {
           <div class="head-actions">
             <button type="button" class="btn small" data-testid="board-insert" @click="doInsert">插入帧</button>
             <button type="button" class="btn small danger" data-testid="board-remove" @click="doRemove">删除选中帧</button>
+            <button type="button" class="btn small" data-testid="board-replan" @click="replanFromProps">按道具绝对位置重算</button>
             <button type="button" class="btn small" @click="syncShotRange">重算时长</button>
           </div>
         </div>
@@ -213,23 +266,46 @@ function shiftFrame(frame: FrameEntry, dir: -1 | 1) {
       </div>
 
       <div class="panel">
-        <div class="panel-head"><h2>帧序明细</h2><span class="muted">可上下移动单帧，序号自动重排</span></div>
+        <div class="panel-head"><h2>帧序明细</h2><span class="muted">绝对位置由道具区间规划 · 相邻位移 = 本帧 − 上一帧 · 可上下移动单帧</span></div>
         <table class="table" data-testid="board-table">
           <thead>
-            <tr><th>位次</th><th>帧号</th><th>张数</th><th>曝光 s</th><th>光圈</th><th>ISO</th><th>位移 mm</th><th>操作</th></tr>
+            <tr>
+              <th>位次</th><th>帧号</th><th>张数</th><th>拍摄</th>
+              <th>绝对位置 X</th><th>绝对位置 Y</th><th>绝对位置 Z</th>
+              <th>相邻位移 ΔX</th><th>相邻位移 ΔY</th><th>相邻位移 ΔZ</th>
+              <th>曝光 s</th><th>光圈</th><th>ISO</th><th>状态</th><th>操作</th>
+            </tr>
           </thead>
           <tbody>
-            <tr v-for="(frame, index) in ordered" :key="frame.id ?? index" :class="{ active: frame.frameNo === selectedFrameNo }" @click="select(frame.frameNo)">
+            <tr
+              v-for="(row, index) in frameRows"
+              :key="row.frame.id ?? index"
+              :class="{ active: row.frame.frameNo === selectedFrameNo, 'row-reshoot': row.frame.needsReshoot }"
+              @click="select(row.frame.frameNo)"
+            >
               <td>{{ index + 1 }}</td>
-              <td class="mono">{{ frame.frameNo }}</td>
-              <td>{{ frame.shotCount }} 张</td>
-              <td>{{ frame.exposureSec }}</td>
-              <td>f/{{ frame.aperture }}</td>
-              <td>{{ frame.iso }}</td>
-              <td>{{ frame.propOffsetMm }}</td>
+              <td class="mono">{{ row.frame.frameNo }}</td>
+              <td>{{ row.frame.shotCount }} 张</td>
+              <td>
+                <span v-if="row.frame.shotFrame" class="shot-done">已拍</span>
+                <span v-else class="muted">未拍</span>
+              </td>
+              <td>{{ row.pos.x }}</td>
+              <td>{{ row.pos.y }}</td>
+              <td>{{ row.pos.z }}</td>
+              <td>{{ row.delta.x }}</td>
+              <td>{{ row.delta.y }}</td>
+              <td>{{ row.delta.z }}</td>
+              <td>{{ row.frame.exposureSec }}</td>
+              <td>f/{{ row.frame.aperture }}</td>
+              <td>{{ row.frame.iso }}</td>
+              <td>
+                <span v-if="row.frame.needsReshoot" class="reshoot-tag">需补拍</span>
+                <span v-else class="muted">—</span>
+              </td>
               <td class="row-actions">
-                <button type="button" class="btn tiny" :disabled="index === 0" @click.stop="shiftFrame(frame, -1)">上移</button>
-                <button type="button" class="btn tiny" :disabled="index === ordered.length - 1" @click.stop="shiftFrame(frame, 1)">下移</button>
+                <button type="button" class="btn tiny" :disabled="index === 0" @click.stop="shiftFrame(row.frame, -1)">上移</button>
+                <button type="button" class="btn tiny" :disabled="index === frameRows.length - 1" @click.stop="shiftFrame(row.frame, 1)">下移</button>
               </td>
             </tr>
           </tbody>
@@ -422,5 +498,42 @@ h1 {
   border-radius: 8px;
   padding: 8px 12px;
   font-size: 13px;
+}
+.reshoot-bar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  background: #fff7e6;
+  border: 1px solid #ffd591;
+  color: #874d00;
+  border-radius: 8px;
+  padding: 8px 14px;
+  font-size: 13px;
+  margin-bottom: 12px;
+}
+.reshoot-bar b {
+  color: #c45600;
+}
+.table tr.row-reshoot {
+  background: #fff7e6;
+}
+.reshoot-tag {
+  display: inline-block;
+  background: #fff7e6;
+  border: 1px solid #ffd591;
+  color: #c45600;
+  border-radius: 4px;
+  padding: 1px 8px;
+  font-size: 12px;
+}
+.shot-done {
+  display: inline-block;
+  background: #f0f9eb;
+  border: 1px solid #b3e19d;
+  color: #389e0d;
+  border-radius: 4px;
+  padding: 1px 8px;
+  font-size: 12px;
 }
 </style>

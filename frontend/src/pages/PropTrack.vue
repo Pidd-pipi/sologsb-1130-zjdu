@@ -1,27 +1,33 @@
 <script setup lang="ts">
 /**
- * 道具位移轨迹：按镜头与帧区间登记 X/Y/Z 位置与旋转角度，
- * 并以 SVG 折线预览各帧的累计位移量。消费 PropState、FrameEntry。
+ * 道具位移轨迹：按镜头与帧区间登记 X/Y/Z 绝对位置与旋转角度，
+ * 以绝对位置为规划来源重算逐帧位置与相邻位移，并标出需补拍的已拍帧。
+ * 消费 PropState、FrameEntry、frameStore.pendingPlan。
  */
 import { computed, onMounted, ref, watch } from 'vue';
 import { storeToRefs } from 'pinia';
 import { useShotStore } from '../stores/shotStore';
+import { useFrameStore } from '../stores/frameStore';
 import * as api from '../db/api';
 import { accumulateOffsets, buildCurvePoints, estimateSpeed } from '../utils/frameMath';
+import { frameDelta, framePos, type Vec3 } from '../utils/propPlanning';
 import { formatMm } from '../utils/format';
 import { FIXATION_OPTIONS, type Fixation, type PropState } from '../types/prop';
 import type { FrameEntry } from '../types/frame';
 import EmptyState from '../components/common/EmptyState.vue';
 import StatusTag from '../components/common/StatusTag.vue';
+import PlanBanner from '../components/common/PlanBanner.vue';
 
 const shotStore = useShotStore();
+const frameStore = useFrameStore();
 const { shots } = storeToRefs(shotStore);
+const { frames, pendingPlan } = storeToRefs(frameStore);
 
 const activeShotId = ref<number | null>(null);
 const props = ref<PropState[]>([]);
-const frames = ref<FrameEntry[]>([]);
 const feedback = ref('');
 const editingId = ref<number | null>(null);
+const replanning = ref(false);
 
 const form = ref({
   name: '',
@@ -60,6 +66,25 @@ const avgSpeed = computed(() => {
   return Math.round((sum / orderedFrames.value.length) * 100) / 100;
 });
 
+/** 逐帧行：绝对位置 + 相邻位移（ΔX/ΔY/ΔZ）+ 补拍标记 */
+interface FrameRow {
+  frame: FrameEntry;
+  pos: Vec3;
+  delta: Vec3;
+}
+const frameRows = computed<FrameRow[]>(() => {
+  const rows: FrameRow[] = [];
+  let prev: FrameEntry | null = null;
+  for (const f of orderedFrames.value) {
+    const pos = framePos(f);
+    const delta = prev ? frameDelta(prev, f) : { ...pos };
+    rows.push({ frame: f, pos, delta });
+    prev = f;
+  }
+  return rows;
+});
+const reshootCount = computed(() => frameRows.value.filter((r) => r.frame.needsReshoot).length);
+
 onMounted(async () => {
   if (!shotStore.ready) await shotStore.load();
   const first = shots.value[0];
@@ -75,7 +100,7 @@ watch(activeShotId, async (id) => {
 
 async function load(id: number) {
   props.value = await api.listProps(id);
-  frames.value = await api.listFrames(id);
+  await frameStore.loadForShot(id);
   editingId.value = null;
 }
 
@@ -105,6 +130,26 @@ function startEdit(row: PropState) {
   };
 }
 
+/** 以修改区间的起点为重算起点，失败自动回滚 */
+async function runReplan(anchorFrame: number) {
+  if (activeShotId.value === null) return;
+  replanning.value = true;
+  try {
+    const result = await frameStore.replanFromProps(anchorFrame);
+    if (result && result.reshootFrameNos.length > 0) {
+      flash(`已重算：从第 ${result.reshootFromFrame} 帧起需补拍，待场记确认`);
+    } else if (result && result.changedFrameNos.length) {
+      flash(`已按绝对位置重算 ${result.changedFrameNos.length} 帧位移`);
+    } else {
+      flash('重算完成，帧序无变化');
+    }
+  } catch {
+    flash('重算失败，已恢复动手前的轨迹与帧序');
+  } finally {
+    replanning.value = false;
+  }
+}
+
 async function submit() {
   if (activeShotId.value === null) return;
   if (!form.value.name.trim()) {
@@ -115,7 +160,7 @@ async function submit() {
   const toFrame = Math.max(fromFrame, Math.floor(form.value.toFrame));
   if (editingId.value !== null) {
     await api.updateProp(editingId.value, { ...form.value, name: form.value.name.trim(), fromFrame, toFrame });
-    flash('已更新道具位移记录');
+    flash('已更新道具记录');
   } else {
     const payload: PropState = {
       name: form.value.name.trim(),
@@ -130,35 +175,28 @@ async function submit() {
       updatedAt: Date.now(),
     };
     await api.addProp(payload);
-    flash('已登记道具位移记录');
+    flash('已登记道具记录');
   }
   await load(activeShotId.value);
   resetForm();
+  await runReplan(fromFrame);
 }
 
 async function removeProp(id: number | undefined) {
-  if (typeof id !== 'number') return;
+  if (typeof id !== 'number' || activeShotId.value === null) return;
+  const target = props.value.find((p) => p.id === id);
+  const anchor = target ? target.fromFrame : 1;
   await api.deleteProp(id);
-  if (activeShotId.value !== null) await load(activeShotId.value);
+  await load(activeShotId.value);
   flash('已删除该道具记录');
+  await runReplan(anchor);
 }
 
-/** 把道具位置按帧区间均匀展开，形成位移轨迹点 */
-const trajectoryPoints = computed(() =>
-  props.value.map((p) => {
-    const span = Math.max(1, p.toFrame - p.fromFrame);
-    return {
-      id: p.id ?? 0,
-      name: p.name,
-      from: p.fromFrame,
-      to: p.toFrame,
-      stepX: Math.round(((p.posX) / span) * 100) / 100,
-      stepY: Math.round(((p.posY) / span) * 100) / 100,
-      stepZ: Math.round(((p.posZ) / span) * 100) / 100,
-      fixation: p.fixation,
-    };
-  }),
-);
+/** 手动重算：从最早区间起点开始 */
+async function manualReplan() {
+  const anchor = props.value.length ? Math.min(...props.value.map((p) => p.fromFrame)) : 1;
+  await runReplan(anchor);
+}
 </script>
 
 <template>
@@ -166,7 +204,7 @@ const trajectoryPoints = computed(() =>
     <header class="page-head">
       <div>
         <h1>道具位移轨迹</h1>
-        <p class="sub">按镜头与帧区间登记道具 X/Y/Z 位置与旋转角度，曲线预览累计位移量</p>
+        <p class="sub">按镜头与帧区间登记道具 X/Y/Z 绝对位置，以绝对位置为规划来源重算逐帧位置与相邻位移</p>
       </div>
       <div class="head-actions">
         <select v-model.number="activeShotId" class="shot-select" data-testid="prop-shot-select">
@@ -185,6 +223,7 @@ const trajectoryPoints = computed(() =>
 
     <template v-else-if="activeShot">
       <p v-if="feedback" class="feedback" data-testid="prop-feedback">{{ feedback }}</p>
+      <PlanBanner />
 
       <div class="panel">
         <div class="panel-head">
@@ -208,7 +247,10 @@ const trajectoryPoints = computed(() =>
         </div>
         <div class="actions">
           <button type="button" class="btn primary" data-testid="prop-track-submit" @click="submit">
-            {{ editingId === null ? '登记道具' : '保存修改' }}
+            {{ editingId === null ? '登记道具并重算' : '保存修改并重算' }}
+          </button>
+          <button type="button" class="btn" :disabled="replanning" @click="manualReplan">
+            {{ replanning ? '重算中…' : '重算轨迹' }}
           </button>
           <button type="button" class="btn" @click="resetForm">清空表单</button>
         </div>
@@ -232,7 +274,7 @@ const trajectoryPoints = computed(() =>
         <div class="panel-head"><h2>道具记录</h2><span class="muted">共 {{ props.length }} 条</span></div>
         <table v-if="props.length" class="table" data-testid="prop-track-table">
           <thead>
-            <tr><th>道具</th><th>帧区间</th><th>X</th><th>Y</th><th>Z</th><th>旋转</th><th>固定方式</th><th>操作</th></tr>
+            <tr><th>道具</th><th>帧区间</th><th>绝对 X</th><th>绝对 Y</th><th>绝对 Z</th><th>旋转</th><th>固定方式</th><th>操作</th></tr>
           </thead>
           <tbody>
             <tr v-for="p in props" :key="p.id">
@@ -254,23 +296,48 @@ const trajectoryPoints = computed(() =>
       </div>
 
       <div class="panel">
-        <div class="panel-head"><h2>按帧区间折算的单帧位移</h2><span class="muted">均匀分摊后的每帧增量</span></div>
-        <table v-if="trajectoryPoints.length" class="table">
+        <div class="panel-head">
+          <h2>逐帧位置与相邻位移</h2>
+          <span class="muted">
+            绝对位置由道具区间规划 · 相邻位移 = 本帧位置 − 上一帧位置
+            <template v-if="reshootCount"> · <span class="reshoot-tag">{{ reshootCount }} 帧需补拍</span></template>
+          </span>
+        </div>
+        <table v-if="frameRows.length" class="table" data-testid="prop-frames-table">
           <thead>
-            <tr><th>道具</th><th>帧区间</th><th>单帧 ΔX</th><th>单帧 ΔY</th><th>单帧 ΔZ</th><th>固定方式</th></tr>
+            <tr>
+              <th>帧号</th>
+              <th>拍摄</th>
+              <th>绝对位置 X</th>
+              <th>绝对位置 Y</th>
+              <th>绝对位置 Z</th>
+              <th>相邻位移 ΔX</th>
+              <th>相邻位移 ΔY</th>
+              <th>相邻位移 ΔZ</th>
+              <th>状态</th>
+            </tr>
           </thead>
           <tbody>
-            <tr v-for="t in trajectoryPoints" :key="t.id">
-              <td>{{ t.name }}</td>
-              <td class="mono">{{ t.from }} – {{ t.to }}</td>
-              <td>{{ formatMm(t.stepX) }}</td>
-              <td>{{ formatMm(t.stepY) }}</td>
-              <td>{{ formatMm(t.stepZ) }}</td>
-              <td>{{ t.fixation }}</td>
+            <tr v-for="row in frameRows" :key="row.frame.id ?? row.frame.frameNo" :class="{ 'row-reshoot': row.frame.needsReshoot }">
+              <td class="mono">{{ row.frame.frameNo }}</td>
+              <td>
+                <span v-if="row.frame.shotFrame" class="shot-done">已拍</span>
+                <span v-else class="muted">未拍</span>
+              </td>
+              <td>{{ formatMm(row.pos.x) }}</td>
+              <td>{{ formatMm(row.pos.y) }}</td>
+              <td>{{ formatMm(row.pos.z) }}</td>
+              <td>{{ formatMm(row.delta.x) }}</td>
+              <td>{{ formatMm(row.delta.y) }}</td>
+              <td>{{ formatMm(row.delta.z) }}</td>
+              <td>
+                <span v-if="row.frame.needsReshoot" class="reshoot-tag">需补拍</span>
+                <span v-else class="muted">—</span>
+              </td>
             </tr>
           </tbody>
         </table>
-        <p v-else class="muted">登记道具后这里会给出每帧增量。</p>
+        <p v-else class="muted">登记道具并重算后，这里给出逐帧绝对位置与相邻位移。</p>
       </div>
     </template>
   </section>
@@ -376,6 +443,9 @@ h1 {
   font-weight: 600;
   font-size: 12px;
 }
+.table tr.row-reshoot {
+  background: #fff7e6;
+}
 .mono {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
 }
@@ -411,6 +481,10 @@ h1 {
   color: #c45656;
   border-color: #f0c8c8;
 }
+.btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
 .feedback {
   margin: 0;
   background: #eef6ff;
@@ -419,5 +493,23 @@ h1 {
   border-radius: 8px;
   padding: 8px 12px;
   font-size: 13px;
+}
+.reshoot-tag {
+  display: inline-block;
+  background: #fff7e6;
+  border: 1px solid #ffd591;
+  color: #c45600;
+  border-radius: 4px;
+  padding: 1px 8px;
+  font-size: 12px;
+}
+.shot-done {
+  display: inline-block;
+  background: #f0f9eb;
+  border: 1px solid #b3e19d;
+  color: #389e0d;
+  border-radius: 4px;
+  padding: 1px 8px;
+  font-size: 12px;
 }
 </style>

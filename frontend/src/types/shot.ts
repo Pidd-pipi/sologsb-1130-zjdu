@@ -27,6 +27,8 @@ export interface Shot {
   owner: string;
   /** 完成百分比快照（由实拍记录回写，0-100） */
   progressPercent: number;
+  /** 需补拍的起始帧号（场记确认规划变更后回填，null/undefined 表示无补拍） */
+  reshootFromFrame?: number | null;
   /** 创建时间戳 */
   createdAt: number;
   updatedAt: number;
@@ -42,6 +44,7 @@ export const createEmptyShot = (): Shot => ({
   status: '未开机',
   owner: '',
   progressPercent: 0,
+  reshootFromFrame: null,
   createdAt: Date.now(),
   updatedAt: Date.now(),
 });

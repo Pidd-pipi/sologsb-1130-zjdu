@@ -13,6 +13,7 @@ import { useFrameSequence } from '../hooks/useFrameSequence';
 import { useProgress } from '../hooks/useProgress';
 import * as api from '../db/api';
 import { durationToFrames, estimateSpeed, framesToDuration } from '../utils/frameMath';
+import { frameDelta, framePos, type Vec3 } from '../utils/propPlanning';
 import { FIXATION_OPTIONS, type Fixation, type PropState } from '../types/prop';
 import { SHOT_STATUS_OPTIONS, type ShotStatus } from '../types/shot';
 import type { FrameEntry } from '../types/frame';
@@ -23,12 +24,13 @@ import ExposureForm from '../components/common/ExposureForm.vue';
 import ShotProgress from '../components/common/ShotProgress.vue';
 import StatusTag from '../components/common/StatusTag.vue';
 import EmptyState from '../components/common/EmptyState.vue';
+import PlanBanner from '../components/common/PlanBanner.vue';
 
 const route = useRoute();
 const router = useRouter();
 const shotStore = useShotStore();
 const frameStore = useFrameStore();
-const { frames, selectedFrameNo } = storeToRefs(frameStore);
+const { frames, selectedFrameNo, pendingPlan } = storeToRefs(frameStore);
 
 const { insertAfter, removeAt, move, patch, select, syncShotRange } = useFrameSequence();
 const { registerTake, summaries, loadTakes, computeProgress } = useProgress();
@@ -198,6 +200,51 @@ const consumed = computed(() => {
 function speedOf(frame: FrameEntry) {
   return estimateSpeed(frame.propOffsetMm, shot.value?.fps ?? 24);
 }
+
+/** 逐帧行：绝对位置 + 相邻位移 + 已拍/补拍标记 */
+interface FrameRow {
+  frame: FrameEntry;
+  pos: Vec3;
+  delta: Vec3;
+}
+const frameRows = computed<FrameRow[]>(() => {
+  const rows: FrameRow[] = [];
+  let prev: FrameEntry | null = null;
+  for (const f of frames.value) {
+    const pos = framePos(f);
+    const delta = prev ? frameDelta(prev, f) : { ...pos };
+    rows.push({ frame: f, pos, delta });
+    prev = f;
+  }
+  return rows;
+});
+const reshootFromFrame = computed(() => shot.value?.reshootFromFrame ?? null);
+
+/** 以道具绝对位置重算帧序，失败自动回滚 */
+async function replanFromProps() {
+  if (shotId.value === null) return;
+  try {
+    const result = await frameStore.replanFromProps();
+    if (result && result.reshootFrameNos.length > 0) {
+      flash(`已重算：从第 ${result.reshootFromFrame} 帧起需补拍，待场记确认`);
+    } else if (result && result.changedFrameNos.length) {
+      flash(`已按绝对位置重算 ${result.changedFrameNos.length} 帧位移`);
+    } else {
+      flash('重算完成，帧序无变化');
+    }
+  } catch {
+    flash('重算失败，已恢复动手前的轨迹与帧序');
+  }
+}
+
+async function markReshootDone() {
+  try {
+    await frameStore.markReshootDone();
+    flash('已标记补拍完成，补拍起点已清除');
+  } catch {
+    flash('操作失败，已恢复');
+  }
+}
 </script>
 
 <template>
@@ -227,6 +274,12 @@ function speedOf(frame: FrameEntry) {
 
     <template v-else-if="shot">
       <p v-if="feedback" class="feedback" data-testid="detail-feedback">{{ feedback }}</p>
+      <PlanBanner />
+
+      <div v-if="reshootFromFrame !== null" class="reshoot-bar" data-testid="detail-reshoot-bar">
+        <span>本镜头从第 <b>{{ reshootFromFrame }}</b> 帧起需补拍（场记已确认规划变更）。</span>
+        <button type="button" class="btn tiny" @click="markReshootDone">标记补拍完成</button>
+      </div>
 
       <div class="panel">
         <div class="panel-head"><h2>镜头参数与进度</h2></div>
@@ -306,6 +359,7 @@ function speedOf(frame: FrameEntry) {
           <h2>帧条目表格</h2>
           <div class="head-actions">
             <button type="button" class="btn small" data-testid="insert-frame" @click="addFrameWithExposure">插入帧</button>
+            <button type="button" class="btn small" data-testid="detail-replan" @click="replanFromProps">按道具绝对位置重算</button>
             <button type="button" class="btn small" @click="syncShotRange">重算时长</button>
           </div>
         </div>
@@ -315,34 +369,57 @@ function speedOf(frame: FrameEntry) {
             <tr>
               <th>帧号</th>
               <th>张数</th>
+              <th>拍摄</th>
+              <th>绝对位置 X</th>
+              <th>绝对位置 Y</th>
+              <th>绝对位置 Z</th>
+              <th>相邻位移 ΔX</th>
+              <th>相邻位移 ΔY</th>
+              <th>相邻位移 ΔZ</th>
               <th>曝光 s</th>
               <th>光圈</th>
               <th>ISO</th>
               <th>快门角</th>
               <th>灯光</th>
-              <th>位移 mm</th>
-              <th>位移速度</th>
+              <th>状态</th>
               <th>操作</th>
             </tr>
           </thead>
           <tbody>
-            <tr v-for="frame in frames" :key="frame.id ?? frame.frameNo" :class="{ active: frame.frameNo === selectedFrameNo }" @click="select(frame.frameNo)">
-              <td class="mono">{{ frame.frameNo }}</td>
+            <tr
+              v-for="row in frameRows"
+              :key="row.frame.id ?? row.frame.frameNo"
+              :class="{ active: row.frame.frameNo === selectedFrameNo, 'row-reshoot': row.frame.needsReshoot }"
+              @click="select(row.frame.frameNo)"
+            >
+              <td class="mono">{{ row.frame.frameNo }}</td>
               <td>
-                <select :value="frame.shotCount" @change="editCell(frame, 'shotCount', ($event.target as HTMLSelectElement).value)">
+                <select :value="row.frame.shotCount" @change="editCell(row.frame, 'shotCount', ($event.target as HTMLSelectElement).value)">
                   <option v-for="c in shotCountOptions" :key="c" :value="c">{{ c }}</option>
                 </select>
               </td>
-              <td><input type="number" min="0.008" max="8" step="0.008" :value="frame.exposureSec" @change="editCell(frame, 'exposureSec', ($event.target as HTMLInputElement).value)" /></td>
-              <td><input type="number" min="1.4" max="22" step="0.1" :value="frame.aperture" @change="editCell(frame, 'aperture', ($event.target as HTMLInputElement).value)" /></td>
-              <td><input type="number" min="100" max="3200" step="100" :value="frame.iso" @change="editCell(frame, 'iso', ($event.target as HTMLInputElement).value)" /></td>
-              <td><input type="number" min="45" max="360" step="1" :value="frame.shutterAngle" @change="editCell(frame, 'shutterAngle', ($event.target as HTMLInputElement).value)" /></td>
-              <td><input type="text" maxlength="20" :value="frame.lighting" @change="editCell(frame, 'lighting', ($event.target as HTMLInputElement).value, false)" /></td>
-              <td><input type="number" min="-200" max="200" step="0.5" :value="frame.propOffsetMm" @change="editCell(frame, 'propOffsetMm', ($event.target as HTMLInputElement).value)" /></td>
-              <td class="muted">{{ speedOf(frame) }} mm/s</td>
+              <td>
+                <span v-if="row.frame.shotFrame" class="shot-done">已拍</span>
+                <span v-else class="muted">未拍</span>
+              </td>
+              <td>{{ row.pos.x }}</td>
+              <td>{{ row.pos.y }}</td>
+              <td>{{ row.pos.z }}</td>
+              <td>{{ row.delta.x }}</td>
+              <td>{{ row.delta.y }}</td>
+              <td>{{ row.delta.z }}</td>
+              <td><input type="number" min="0.008" max="8" step="0.008" :value="row.frame.exposureSec" @change="editCell(row.frame, 'exposureSec', ($event.target as HTMLInputElement).value)" /></td>
+              <td><input type="number" min="1.4" max="22" step="0.1" :value="row.frame.aperture" @change="editCell(row.frame, 'aperture', ($event.target as HTMLInputElement).value)" /></td>
+              <td><input type="number" min="100" max="3200" step="100" :value="row.frame.iso" @change="editCell(row.frame, 'iso', ($event.target as HTMLInputElement).value)" /></td>
+              <td><input type="number" min="45" max="360" step="1" :value="row.frame.shutterAngle" @change="editCell(row.frame, 'shutterAngle', ($event.target as HTMLInputElement).value)" /></td>
+              <td><input type="text" maxlength="20" :value="row.frame.lighting" @change="editCell(row.frame, 'lighting', ($event.target as HTMLInputElement).value, false)" /></td>
+              <td>
+                <span v-if="row.frame.needsReshoot" class="reshoot-tag">需补拍</span>
+                <span v-else class="muted">—</span>
+              </td>
               <td class="row-actions">
-                <button type="button" class="btn tiny" @click.stop="insertAfter(frame.frameNo)">后插</button>
-                <button type="button" class="btn tiny danger" :disabled="frames.length <= 1" @click.stop="removeFrameRow(frame.frameNo)">删除</button>
+                <button type="button" class="btn tiny" @click.stop="insertAfter(row.frame.frameNo)">后插</button>
+                <button type="button" class="btn tiny danger" :disabled="frames.length <= 1" @click.stop="removeFrameRow(row.frame.frameNo)">删除</button>
               </td>
             </tr>
           </tbody>
@@ -619,5 +696,42 @@ h1 .mono {
   border-radius: 8px;
   padding: 8px 12px;
   font-size: 13px;
+}
+.reshoot-bar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  background: #fff7e6;
+  border: 1px solid #ffd591;
+  color: #874d00;
+  border-radius: 8px;
+  padding: 8px 14px;
+  font-size: 13px;
+  margin-bottom: 12px;
+}
+.reshoot-bar b {
+  color: #c45600;
+}
+.table tr.row-reshoot {
+  background: #fff7e6;
+}
+.reshoot-tag {
+  display: inline-block;
+  background: #fff7e6;
+  border: 1px solid #ffd591;
+  color: #c45600;
+  border-radius: 4px;
+  padding: 1px 8px;
+  font-size: 12px;
+}
+.shot-done {
+  display: inline-block;
+  background: #f0f9eb;
+  border: 1px solid #b3e19d;
+  color: #389e0d;
+  border-radius: 4px;
+  padding: 1px 8px;
+  font-size: 12px;
 }
 </style>
